@@ -1,1 +1,371 @@
 # hy
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Hand-Controlled Emerald Mine Cloud (Three.js + MediaPipe)</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#05050a; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #hud{
+      position:fixed; left:12px; top:12px; z-index:5;
+      padding:10px 12px; border-radius:12px;
+      background: rgba(0,0,0,0.45); color:#fff; backdrop-filter: blur(10px);
+      font-size:13px; line-height:1.35; max-width:min(360px, 92vw);
+    }
+    #hud b{ font-weight:700 }
+    #badge{
+      display:inline-block; margin-top:6px; padding:4px 8px; border-radius:999px;
+      background: rgba(255,255,255,0.12);
+    }
+    #warn{
+      position:fixed; left:12px; bottom:12px; z-index:5;
+      padding:10px 12px; border-radius:12px;
+      background: rgba(255,120,120,0.15); color:#fff;
+      font-size:12px; max-width:min(520px, 92vw);
+    }
+    video{ display:none; }
+    canvas{ display:block; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><b>Emerald Mines</b> • Hand-controlled 3D</div>
+    <div id="status">Camera: waiting…</div>
+    <div id="modeLine"><b>Mode:</b> DATA</div>
+    <div id="gestureLine"><b>Gesture:</b> none</div>
+    <div id="badge">Pinch = Zoom • Open hand move = Rotate • Fist = Switch Mode</div>
+  </div>
+
+  <div id="warn">
+    Note: Camera permission needs <b>HTTPS</b> (or localhost). Use good lighting for stable tracking.
+  </div>
+
+  <video id="video" playsinline></video>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    // ---------- Scene ----------
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x05050a, 8, 40);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 200);
+    camera.position.set(0, 0.8, 10);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+    scene.add(ambient);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 0.85);
+    dir.position.set(6, 10, 6);
+    scene.add(dir);
+
+    // Subtle grid
+    const grid = new THREE.GridHelper(40, 40, 0x222244, 0x111122);
+    grid.position.y = -2.2;
+    grid.material.opacity = 0.22;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // ---------- Random “chemical” dataset (clusters per mine) ----------
+    const mines = [
+      { name:"Colombia",    center:[ 1.7,  0.6, -0.8], color:0x37ff8b },
+      { name:"Zambia",      center:[-1.3, -0.2,  1.2], color:0x42c5ff },
+      { name:"Russia",      center:[ 0.6,  1.1,  1.5], color:0xb07cff },
+      { name:"Afghanistan", center:[-1.8,  0.9, -1.0], color:0xffcc4a },
+      { name:"Ethiopia",    center:[ 0.2, -0.9, -1.6], color:0xff5da2 },
+    ];
+
+    // we pretend x=Fe, y=Cr, z=V (scaled)
+    const POINTS = 9000; // mobile-friendly; increase later on laptop
+    const positions = new Float32Array(POINTS * 3);
+    const colors    = new Float32Array(POINTS * 3);
+
+    // store base (data) positions for Mode: DATA
+    const basePositions = new Float32Array(POINTS * 3);
+
+    // helper
+    function hexToRgb01(hex){
+      const c = new THREE.Color(hex);
+      return [c.r, c.g, c.b];
+    }
+
+    // generate clustered points
+    for(let i=0;i<POINTS;i++){
+      const m = mines[i % mines.length];
+      const [cx,cy,cz] = m.center;
+
+      // gaussian-ish cluster
+      const jx = (Math.random()-0.5) * 1.2;
+      const jy = (Math.random()-0.5) * 1.2;
+      const jz = (Math.random()-0.5) * 1.2;
+
+      const x = cx + jx;
+      const y = cy + jy;
+      const z = cz + jz;
+
+      positions[i*3+0] = x; positions[i*3+1] = y; positions[i*3+2] = z;
+      basePositions[i*3+0] = x; basePositions[i*3+1] = y; basePositions[i*3+2] = z;
+
+      const [r,g,b] = hexToRgb01(m.color);
+      colors[i*3+0] = r; colors[i*3+1] = g; colors[i*3+2] = b;
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+    const mat = new THREE.PointsMaterial({
+      size: 0.035,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false
+    });
+
+    const cloud = new THREE.Points(geom, mat);
+    scene.add(cloud);
+
+    // ---------- Modes / Templates ----------
+    const MODES = ["DATA", "HEART", "SATURN", "FIREWORKS"];
+    let modeIndex = 0;
+
+    function setMode(i){
+      modeIndex = (i + MODES.length) % MODES.length;
+      document.getElementById("modeLine").innerHTML = "<b>Mode:</b> " + MODES[modeIndex];
+      buildTargetPositions(MODES[modeIndex]);
+    }
+
+    const targetPositions = new Float32Array(POINTS * 3);
+
+    function buildTargetPositions(mode){
+      if(mode === "DATA"){
+        targetPositions.set(basePositions);
+        return;
+      }
+
+      if(mode === "HEART"){
+        // 2D heart formula projected in 3D
+        for(let i=0;i<POINTS;i++){
+          const t = (i/POINTS) * Math.PI * 2;
+          const r = Math.sqrt(Math.random());
+          const x2 = 16*Math.pow(Math.sin(t),3);
+          const y2 = 13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t);
+          const x = (x2/18) * (1.6*r);
+          const y = (y2/18) * (1.6*r);
+          const z = (Math.random()-0.5) * 0.9;
+          targetPositions[i*3+0] = x;
+          targetPositions[i*3+1] = y;
+          targetPositions[i*3+2] = z;
+        }
+        return;
+      }
+
+      if(mode === "SATURN"){
+        // ring + core
+        for(let i=0;i<POINTS;i++){
+          const isCore = (i % 6 === 0);
+          if(isCore){
+            const u = (Math.random()-0.5)*0.6;
+            const v = (Math.random()-0.5)*0.6;
+            const w = (Math.random()-0.5)*0.6;
+            targetPositions[i*3+0]=u; targetPositions[i*3+1]=v; targetPositions[i*3+2]=w;
+          }else{
+            const a = Math.random()*Math.PI*2;
+            const rad = 2.2 + (Math.random()-0.5)*0.35;
+            const x = Math.cos(a)*rad;
+            const z = Math.sin(a)*rad;
+            const y = (Math.random()-0.5)*0.25;
+            targetPositions[i*3+0]=x; targetPositions[i*3+1]=y; targetPositions[i*3+2]=z;
+          }
+        }
+        return;
+      }
+
+      if(mode === "FIREWORKS"){
+        // multiple bursts
+        for(let i=0;i<POINTS;i++){
+          const burst = i % mines.length;
+          const bx = mines[burst].center[0]*1.5;
+          const by = mines[burst].center[1]*1.5;
+          const bz = mines[burst].center[2]*1.5;
+          const theta = Math.random()*Math.PI*2;
+          const phi = Math.acos(2*Math.random()-1);
+          const r = 0.2 + Math.random()*2.6;
+          const x = bx + r*Math.sin(phi)*Math.cos(theta);
+          const y = by + r*Math.cos(phi);
+          const z = bz + r*Math.sin(phi)*Math.sin(theta);
+          targetPositions[i*3+0]=x; targetPositions[i*3+1]=y; targetPositions[i*3+2]=z;
+        }
+        return;
+      }
+    }
+
+    // tween strength
+    let morph = 0.08;
+
+    // ---------- Hand control state ----------
+    let handFound = false;
+    let gesture = "none";
+
+    // rotate controls
+    let yaw = 0, pitch = 0;
+    let zoom = 10; // camera distance target
+
+    // smoothing
+    let targetYaw = 0, targetPitch = 0, targetZoom = 10;
+
+    function setStatus(text){ document.getElementById("status").textContent = text; }
+    function setGesture(text){
+      document.getElementById("gestureLine").innerHTML = "<b>Gesture:</b> " + text;
+    }
+
+    // ---------- MediaPipe Hands (JS) ----------
+    import { Hands } from "https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js";
+    import { Camera } from "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js";
+
+    const video = document.getElementById("video");
+
+    function dist(a,b){
+      const dx=a.x-b.x, dy=a.y-b.y;
+      return Math.sqrt(dx*dx + dy*dy);
+    }
+
+    function classifyGesture(landmarks){
+      const thumbTip = landmarks[4];
+      const indexTip = landmarks[8];
+      const middleTip= landmarks[12];
+      const ringTip  = landmarks[16];
+      const pinkyTip = landmarks[20];
+      const wrist    = landmarks[0];
+
+      const pinchD = dist(thumbTip, indexTip);
+      const fistScore = (dist(indexTip,wrist)+dist(middleTip,wrist)+dist(ringTip,wrist)+dist(pinkyTip,wrist))/4;
+
+      if(pinchD < 0.05) return { g:"pinch", pinchD, fistScore };
+      if(fistScore < 0.25) return { g:"fist", pinchD, fistScore };
+      return { g:"open", pinchD, fistScore };
+    }
+
+    let lastSwitch = 0;
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    hands.onResults((results) => {
+      if(!results.multiHandLandmarks || results.multiHandLandmarks.length === 0){
+        handFound = false;
+        setStatus("Camera: hand not found");
+        setGesture("none");
+        return;
+      }
+
+      handFound = true;
+      const lm = results.multiHandLandmarks[0];
+      const { g, pinchD } = classifyGesture(lm);
+      gesture = g;
+      setStatus("Camera: tracking ✓");
+      setGesture(g);
+
+      // Use landmark 5 (index MCP) as stable center
+      const cx = lm[5].x; // 0..1
+      const cy = lm[5].y; // 0..1
+
+      // Open hand move => rotate (center-based)
+      if(g === "open" || g === "pinch"){
+        targetYaw   = (cx - 0.5) * 1.8;
+        targetPitch = (cy - 0.5) * 1.2;
+      }
+
+      // Pinch => zoom
+      if(g === "pinch"){
+        const z = 6 + (pinchD * 90); // pinch closer => smaller pinchD => closer zoom
+        targetZoom = Math.min(18, Math.max(5.5, z));
+      }
+
+      // Fist => mode switch (debounced)
+      const now = performance.now();
+      if(g === "fist" && (now - lastSwitch) > 650){
+        setMode(modeIndex + 1);
+        lastSwitch = now;
+      }
+    });
+
+    async function startCamera(){
+      try{
+        setStatus("Camera: requesting permission…");
+        const cam = new Camera(video, {
+          onFrame: async () => { await hands.send({ image: video }); },
+          width: 640,
+          height: 480
+        });
+        cam.start();
+        setStatus("Camera: started ✓");
+      }catch(e){
+        console.error(e);
+        setStatus("Camera: permission blocked");
+      }
+    }
+
+    // start in DATA mode
+    setMode(0);
+    startCamera();
+
+    // ---------- Animate ----------
+    function animate(){
+      requestAnimationFrame(animate);
+
+      // smooth camera control
+      yaw   += (targetYaw - yaw) * 0.08;
+      pitch += (targetPitch - pitch) * 0.08;
+      zoom  += (targetZoom - zoom) * 0.08;
+
+      camera.position.x = Math.sin(yaw) * zoom;
+      camera.position.z = Math.cos(yaw) * zoom;
+      camera.position.y = 0.8 + (-pitch * 2.0);
+      camera.lookAt(0, 0, 0);
+
+      // morph towards template
+      const posAttr = geom.getAttribute("position");
+      const p = posAttr.array;
+
+      for(let i=0;i<p.length;i++){
+        p[i] += (targetPositions[i] - p[i]) * morph;
+      }
+      posAttr.needsUpdate = true;
+
+      // slight breathing effect when hand found
+      if(handFound){
+        cloud.rotation.y += 0.0022;
+      }else{
+        cloud.rotation.y += 0.0011;
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // Prevent page scroll on touch
+    document.body.addEventListener("touchmove", (e)=>e.preventDefault(), { passive:false });
+  </script>
+</body>
+</html>
