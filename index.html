@@ -370,4 +370,25 @@
     document.body.addEventListener("touchmove", (e)=>e.preventDefault(), { passive:false });
   </script>
 </body>
+</html>      posAttr.needsUpdate = true;
+
+      if(handFound){
+        cloud.rotation.y += 0.0022;
+      }else{
+        cloud.rotation.y += 0.0011;
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    document.body.addEventListener("touchmove", (e)=>e.preventDefault(), { passive:false });
+  </script>
+</body>
     </html>
